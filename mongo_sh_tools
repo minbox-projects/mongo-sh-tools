@@ -679,12 +679,12 @@ prompt_filter_for_field() {
       echo "    日期格式: 2024-01-01 或 2024-01-01T00:00:00Z"
       local mode; read -rp "  选择 [1-3]: " mode
       case "$mode" in
-        1) local val;  read -rp "  晚于: " val;  val=$(escape_js_str "$val");  echo "\"$fname\":{\"\$gt\":{\"\$date\":\"${val}\"}}" ;;
-        2) local val;  read -rp "  早于: " val;  val=$(escape_js_str "$val");  echo "\"$fname\":{\"\$lt\":{\"\$date\":\"${val}\"}}" ;;
+        1) local val;  read -rp "  晚于: " val;  val=$(escape_js_str "$val");  echo "\"$fname\":{\"\$gt\":new Date(\"${val}\")}" ;;
+        2) local val;  read -rp "  早于: " val;  val=$(escape_js_str "$val");  echo "\"$fname\":{\"\$lt\":new Date(\"${val}\")}" ;;
         3)
           local vmin; read -rp "  开始日期(>=): " vmin; vmin=$(escape_js_str "$vmin")
-          local vmax; read -rp "  结束日期(<=): " vmax; vmax=$(escape_js_str "$vmax")
-          echo "\"$fname\":{\"\$gte\":{\"\$date\":\"${vmin}\"},\"\$lte\":{\"\$date\":\"${vmax}\"}}"
+          local vmax; read -rp "  结束日期(<): " vmax; vmax=$(escape_js_str "$vmax")
+          echo "\"$fname\":{\"\$gte\":new Date(\"${vmin}\"),\"\$lt\":new Date(\"${vmax}\")}"
           ;;
         *) echo "" ;;
       esac
