@@ -370,7 +370,11 @@ run_with_spinner() {
 
   wait "$pid"
   local rc=$?
-  printf "\r  ✓ %s\n" "$msg"
+  if (( rc == 0 )); then
+    printf "\r  ✓ %s\n" "$msg"
+  else
+    printf "\r  ✗ %s\n" "$msg"
+  fi
   return $rc
 }
 
@@ -1243,6 +1247,167 @@ JSEOF
   echo "已导出: $outfile ($line_count 行)"
 }
 
+do_import() {
+  echo ""
+  echo "导入 JSON Lines 数据（每行一条 JSON 文档）"
+  echo "  JSON 导入会保留文件中的 _id；重复 _id 会被跳过并计入失败数。"
+  local infile
+  read -rp "导入文件路径: " infile
+
+  if [[ ! -f "$infile" || ! -r "$infile" ]]; then
+    echo "错误: 文件不存在或不可读"
+    return
+  fi
+
+  local snapshot
+  snapshot=$(mktemp /tmp/mq_import_XXXXXX.json) || {
+    echo "错误: 无法创建导入临时文件"
+    return
+  }
+  chmod 600 "$snapshot"
+  if ! cp "$infile" "$snapshot"; then
+    echo "错误: 无法读取导入文件"
+    rm -f "$snapshot"
+    return
+  fi
+
+  local escaped_file
+  escaped_file=$(escape_js_str "$snapshot")
+  local parse_js
+  parse_js=$(cat <<'JSEOF'
+const fs = require('fs');
+const readline = require('readline');
+async function readImportDocuments(file, onDocument) {
+  const input = fs.createReadStream(file, { encoding: 'utf8' });
+  const lines = readline.createInterface({ input, crlfDelay: Infinity });
+  let count = 0;
+  let lineNumber = 0;
+
+  for await (const line of lines) {
+    lineNumber += 1;
+    if (!line.trim()) continue;
+    let document;
+    try {
+      document = EJSON.parse(line);
+    } catch (error) {
+      throw new Error(`第 ${lineNumber} 行 JSON 无效: ${error.message}`);
+    }
+    if (document === null || Array.isArray(document) || typeof document !== 'object') {
+      throw new Error(`第 ${lineNumber} 行不是 JSON 文档对象`);
+    }
+    count += 1;
+    await onDocument(document);
+  }
+
+  if (count === 0) throw new Error('导入文件为空');
+  return count;
+}
+const importFile = "__IMPORT_FILE__";
+JSEOF
+)
+  parse_js="${parse_js//__IMPORT_FILE__/$escaped_file}"
+
+  local preview_js
+  preview_js=$(cat <<JSEOF
+(async function () {
+$parse_js
+const preview = [];
+const total = await readImportDocuments(importFile, document => {
+  if (preview.length < 3) preview.push(document);
+});
+print('__IMPORT_COUNT__:' + total);
+preview.forEach(document => print(EJSON.stringify(document)));
+})().catch(error => {
+  print('__IMPORT_ERROR__:' + error.message);
+  quit(1);
+});
+JSEOF
+)
+
+  local preview
+  preview=$(run_js "$preview_js")
+  local total
+  total=$(echo "$preview" | sed -n 's/^__IMPORT_COUNT__://p' | head -1)
+  if [[ ! "$total" =~ ^[0-9]+$ ]]; then
+    echo "错误: 无法读取导入文件"
+    [[ -n "$preview" ]] && echo "$preview"
+    rm -f "$snapshot"
+    return
+  fi
+
+  echo ""
+  echo "待导入文档数: $total"
+  echo "预览前 3 条:"
+  echo "$preview" | grep -v '^__IMPORT_COUNT__:'
+  echo ""
+  echo "⚠ 将向集合 [$COLLECTION] 插入 $total 条文档，此操作不可撤销。"
+  local confirm
+  read -rp "确认导入? [y/N]: " confirm
+  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+    echo "已取消"
+    rm -f "$snapshot"
+    return
+  fi
+
+  local escaped_db escaped_collection
+  escaped_db=$(escape_js_str "$DB")
+  escaped_collection=$(escape_js_str "$COLLECTION")
+  local import_js
+  import_js=$(cat <<JSEOF
+(async function () {
+$parse_js
+const col = db.getSiblingDB("$escaped_db").getCollection("$escaped_collection");
+const batchSize = 500;
+let inserted = 0;
+const errors = [];
+let batch = [];
+
+async function insertBatch(documents) {
+  if (documents.length === 0) return;
+  try {
+    const result = await col.insertMany(documents, { ordered: false });
+    inserted += result.insertedCount;
+  } catch (error) {
+    inserted += error.result?.insertedCount || 0;
+    errors.push(error.message);
+  }
+}
+
+const total = await readImportDocuments(importFile, async document => {
+  batch.push(document);
+  if (batch.length === batchSize) {
+    await insertBatch(batch);
+    batch = [];
+  }
+});
+await insertBatch(batch);
+
+print('__IMPORT_RESULT__:' + JSON.stringify({
+  total,
+  inserted,
+  failed: total - inserted,
+  errors: errors.slice(0, 5)
+}));
+})().catch(error => {
+  print('__IMPORT_ERROR__:' + error.message);
+  quit(1);
+});
+JSEOF
+)
+
+  run_js_spinner "正在导入..." "$import_js"
+  local run_result="$RUN_JS_RESULT"
+  rm -f "$snapshot"
+  local result
+  result=$(echo "$run_result" | sed -n 's/^__IMPORT_RESULT__://p' | tail -1)
+  if [[ -n "$result" ]]; then
+    echo "导入结果: $result"
+  else
+    echo "导入失败:"
+    echo "$run_result"
+  fi
+}
+
 # ========== INDEX MANAGEMENT ==========
 
 show_indexes() {
@@ -1770,6 +1935,7 @@ menu_data() {
     echo "── 数据操作 ──────────────────"
     echo "  [1] 删除文档        [2] 更新文档"
     echo "  [3] 导出数据(JSON/CSV)"
+    echo "  [4] 导入数据(JSON)"
     echo "  [b] 返回主菜单"
     echo "──────────────────────────────"
     local act
@@ -1778,6 +1944,7 @@ menu_data() {
       1) do_delete ;;
       2) do_update ;;
       3) do_export ;;
+      4) do_import ;;
       b|B) return ;;
       *) echo "无效输入" ;;
     esac

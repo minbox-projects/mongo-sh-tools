@@ -197,10 +197,14 @@ chmod +x mongo_sh_tools mongosh
 | 1 | 删除文档 | 构建过滤 → 预览匹配数量 → 选择 deleteOne/deleteMany → **二次确认**后执行 |
 | 2 | 更新文档 | 构建过滤 → 预览匹配数量 → 选择字段和新值 → updateOne/updateMany → **二次确认** |
 | 3 | 导出数据 | 构建过滤 → 设置导出条数 → 选择 JSON/CSV 格式 → 流式写入文件 |
+| 4 | 导入数据 | 选择 JSON Lines 文件 → 校验与预览前 3 条 → **确认**后按 500 条一批插入 |
 
 - **删除/更新**：当未设置过滤条件（空 filter）且选择了 Many 操作时，会显示醒目警告
 - **导出数据**：默认导出上限为 `10000` 条（可通过 `~/.mongo_sh_tools/config.json` 的 `exportLimit` 修改），导出时可临时输入其他值，输入 `0` 则不限制
 - CSV 导出以集合字段名作为表头，逐行流式输出，字段中的逗号替换为分号、换行替换为空格
+- 导入文件使用 JSON Lines 格式，即每行一条 JSON 文档；可直接导入脚本导出的 JSON 文件
+- 导入会保留文件中的 `_id`。若目标集合已有相同 `_id`，该文档会导入失败，结果会汇总成功数与失败数
+- 普通 JSON 无法保留 `ObjectId`、`Date` 等 BSON 类型；需要保留类型时，请提供 Extended JSON 格式的导入文件
 
 ### [i] 索引管理
 
@@ -299,6 +303,26 @@ chmod +x mongo_sh_tools mongosh
 ```
 
 > 导出条数上限默认 10000，可在 `~/.mongo_sh_tools/config.json` 中修改 `exportLimit`，或在导出时临时输入其他值（输入 `0` 不限制）。
+
+### 导入 JSON Lines 数据
+
+```
+请输入: d
+选择: 4
+
+导入 JSON Lines 数据（每行一条 JSON 文档）
+导入文件路径: /path/to/data.json
+
+待导入文档数: 100
+预览前 3 条:
+{ ... }
+
+⚠ 将向集合 [device_logs] 插入 100 条文档，此操作不可撤销。
+确认导入? [y/N]: y
+导入结果: {"total":100,"inserted":100,"failed":0,"errors":[]}
+```
+
+导入会先复制源文件到权限为 `600` 的临时快照，确认后始终从该快照读取。若同一集合已存在相同 `_id`，对应文档不会覆盖，而会被计入失败数。
 
 ### Explain 分析慢查询
 
