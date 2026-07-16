@@ -2,6 +2,12 @@
 # MongoDB Interactive Tool
 # Usage: ./mongo_sh
 #
+
+if [[ -t 0 && -t 1 && "$-" != *i* && -z "${MONGO_SH_TOOLS_READLINE:-}" ]]; then
+  export MONGO_SH_TOOLS_READLINE=1
+  exec "$BASH" --noprofile --norc -i "$0" "$@"
+fi
+
 # 部署方式:
 #   1. 下载 mongosh linux x64 压缩包:
 #      https://downloads.mongodb.com/compass/mongosh-2.3.8-linux-x64.tgz
@@ -20,7 +26,7 @@ COLLECTION=""
 FILTER="{}"
 DB=""
 MONGO_URI=""
-RETURN_TO_MAIN=false
+NAV_RETURN_TO_MAIN=10
 DEFAULT_LIMIT=20
 EXPORT_LIMIT=10000
 ENV_NAME=""
@@ -83,30 +89,30 @@ collect_env_params() {
   local prefix="$1"  # display prefix like "  " or "  [环境名] "
   local _host _port _db _user _pass _auth _ssl
 
-  read -rp "${prefix}主机地址 [127.0.0.1]: " _host
+  read -erp "${prefix}主机地址 [127.0.0.1]: " _host
   _host=${_host:-127.0.0.1}
-  read -rp "${prefix}端口 [27017]: " _port
+  read -erp "${prefix}端口 [27017]: " _port
   _port=${_port:-27017}
   while [[ ! "$_port" =~ ^[0-9]+$ ]] || (( _port < 1 || _port > 65535 )); do
     echo "${prefix}无效端口号，请输入 1-65535"
-    read -rp "${prefix}端口 [27017]: " _port
+    read -erp "${prefix}端口 [27017]: " _port
     _port=${_port:-27017}
   done
-  read -rp "${prefix}数据库名: " _db
+  read -erp "${prefix}数据库名: " _db
   while [[ -z "$_db" ]]; do
     echo "${prefix}数据库名不能为空"
-    read -rp "${prefix}数据库名: " _db
+    read -erp "${prefix}数据库名: " _db
   done
-  read -rp "${prefix}用户名 (无认证直接回车): " _user
+  read -erp "${prefix}用户名 (无认证直接回车): " _user
   if [[ -n "$_user" ]]; then
-    read -rsp "${prefix}密码: " _pass; echo ""
-    read -rp "${prefix}认证数据库 [$_db]: " _auth
+    read -ersp "${prefix}密码: " _pass; echo ""
+    read -erp "${prefix}认证数据库 [$_db]: " _auth
     _auth=${_auth:-$_db}
   fi
   echo "${prefix}启用 SSL?"
   echo "${prefix}  [1] 否(默认)  [2] 是"
   local ssl_choice
-  read -rp "${prefix}选择: " ssl_choice
+  read -erp "${prefix}选择: " ssl_choice
   _ssl="false"
   [[ "$ssl_choice" == "2" ]] && _ssl="true"
 
@@ -132,11 +138,11 @@ setup_wizard() {
   echo "  [1] 单环境 — 只配置一个 MongoDB 连接"
   echo "  [2] 多环境 — 配置多个环境(如 开发/测试/生产)"
   local mode
-  read -rp "选择 [默认1]: " mode
+  read -erp "选择 [默认1]: " mode
   mode=${mode:-1}
 
   local limit
-  read -rp "默认查询条数 [20]: " limit
+  read -erp "默认查询条数 [20]: " limit
   limit=${limit:-20}
 
   if [[ "$mode" == "2" ]]; then
@@ -146,7 +152,7 @@ setup_wizard() {
     while true; do
       echo ""
       local env_name
-      read -rp "环境名称 (如 '开发环境'，输入 done 结束添加): " env_name
+      read -erp "环境名称 (如 '开发环境'，输入 done 结束添加): " env_name
       [[ "$env_name" == "done" ]] && break
       [[ -z "$env_name" ]] && continue
 
@@ -305,7 +311,7 @@ select_environment() {
 
   local choice
   while true; do
-    read -rp "请选择环境 [1-${#_names[@]}]: " choice
+    read -erp "请选择环境 [1-${#_names[@]}]: " choice
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#_names[@]} )); then
       break
     fi
@@ -356,12 +362,6 @@ print_sep() {
 }
 
 RUN_JS_RESULT=""
-get_progress_lines_since() {
-  local file="$1" start="$2" end="$3"
-  (( end > start )) || return
-  dd if="$file" iflag=skip_bytes,count_bytes skip="$start" count="$((end - start))" status=none 2>/dev/null
-}
-
 show_progress() {
   local msg="$1" current="$2" total="$3" spin_index="$4"
   if [[ "$current" =~ ^[0-9]+$ && "$total" =~ ^[0-9]+$ ]]; then
@@ -374,115 +374,84 @@ show_progress() {
   fi
 }
 
-run_js_spinner() {
-  local msg="$1" js="$2" total="${3:-}"
-  local LC_ALL=C
-  local jsfile tmpfile
-  jsfile=$(mktemp /tmp/mq_XXXXXX.js)
-  tmpfile=$(mktemp /tmp/mq_XXXXXX.out)
-  chmod 600 "$jsfile" "$tmpfile"
-  echo "$js" > "$jsfile"
+process_mongosh_output_line() {
+  local line="$1" msg="$2" total="$3" output_file="$4" spin_index="$5"
+  if [[ "$line" =~ ^__PROGRESS__:([0-9]+)$ ]]; then
+    MONGOSH_PROGRESS_CURRENT="${BASH_REMATCH[1]}"
+    show_progress "$msg" "$MONGOSH_PROGRESS_CURRENT" "$total" "$spin_index"
+  else
+    printf '%s\n' "$line" >> "$output_file"
+  fi
+}
 
-  "$MONGOSH" "$MONGO_URI" --quiet --file "$jsfile" > "$tmpfile" 2>&1 &
-  local pid=$! i=0 current="" progress_offset=0
+monitor_mongosh_output() {
+  local msg="$1" pid="$2" output_file="$3" total="$4"
+  local line i=0
+  MONGOSH_PROGRESS_CURRENT=""
+
   while kill -0 "$pid" 2>/dev/null; do
-    local progress_end reported
-    progress_end=$(stat -c %s "$tmpfile")
-    if (( progress_end > progress_offset )); then
-      local next_offset="$progress_offset"
-      while IFS= read -r reported; do
-        next_offset=$((next_offset + ${#reported} + 1))
-        if [[ "$reported" =~ ^__PROGRESS__:([0-9]+)$ ]]; then
-          current="${BASH_REMATCH[1]}"
-          show_progress "$msg" "$current" "$total" "$i"
-        fi
-      done < <(get_progress_lines_since "$tmpfile" "$progress_offset" "$progress_end")
-      progress_offset=$next_offset
-    elif [[ -z "$current" ]]; then
-      show_progress "$msg" "$current" "$total" "$i"
+    if IFS= read -r -t 1 line <&3; then
+      process_mongosh_output_line "$line" "$msg" "$total" "$output_file" "$i"
+    elif [[ -z "$MONGOSH_PROGRESS_CURRENT" ]]; then
+      show_progress "$msg" "$MONGOSH_PROGRESS_CURRENT" "$total" "$i"
     fi
     ((i++))
-    sleep 0.1
+  done
+
+  while IFS= read -r line <&3; do
+    process_mongosh_output_line "$line" "$msg" "$total" "$output_file" "$i"
   done
 
   wait "$pid"
-  local rc=$?
-  local progress_end reported
-  progress_end=$(stat -c %s "$tmpfile")
-  if (( progress_end > progress_offset )); then
-    local next_offset="$progress_offset"
-    while IFS= read -r reported; do
-      next_offset=$((next_offset + ${#reported} + 1))
-      if [[ "$reported" =~ ^__PROGRESS__:([0-9]+)$ ]]; then
-        current="${BASH_REMATCH[1]}"
-        show_progress "$msg" "$current" "$total" "$i"
-      fi
-    done < <(get_progress_lines_since "$tmpfile" "$progress_offset" "$progress_end")
-    progress_offset=$next_offset
-  elif [[ -z "$current" ]]; then
-    show_progress "$msg" "$current" "$total" "$i"
-  fi
+}
+
+run_js_spinner() {
+  local msg="$1" js="$2" total="${3:-}"
+  local jsfile tmpfile pipefile pid rc
+  jsfile=$(mktemp /tmp/mq_XXXXXX.js)
+  tmpfile=$(mktemp /tmp/mq_XXXXXX.out)
+  pipefile=$(mktemp /tmp/mq_XXXXXX.pipe)
+  rm -f "$pipefile"
+  mkfifo "$pipefile"
+  chmod 600 "$jsfile" "$tmpfile" "$pipefile"
+  printf '%s\n' "$js" > "$jsfile"
+
+  "$MONGOSH" "$MONGO_URI" --quiet --file "$jsfile" > "$pipefile" 2>&1 &
+  pid=$!
+  exec 3< "$pipefile"
+  monitor_mongosh_output "$msg" "$pid" "$tmpfile" "$total"
+  rc=$?
+  exec 3<&-
+
   if (( rc == 0 )); then
     printf "✓\n"
   else
     printf "✗\n"
   fi
 
-  RUN_JS_RESULT=$(grep -v '^__PROGRESS__:' "$tmpfile")
-  rm -f "$jsfile" "$tmpfile"
+  RUN_JS_RESULT=$(<"$tmpfile")
+  rm -f "$jsfile" "$tmpfile" "$pipefile"
   return $rc
 }
 
 run_export_streaming() {
   local msg="$1" js="$2" outfile="$3" total="$4"
-  local LC_ALL=C
-  local jsfile progressfile errorfile
+  local jsfile errorfile pipefile pid rc
   jsfile=$(mktemp /tmp/mq_XXXXXX.js)
-  progressfile=$(mktemp /tmp/mq_XXXXXX.out)
   errorfile=$(mktemp /tmp/mq_XXXXXX.err)
-  chmod 600 "$jsfile" "$progressfile" "$errorfile"
-  js="${js//__PROGRESS_FILE__/$progressfile}"
-  echo "$js" > "$jsfile"
+  pipefile=$(mktemp /tmp/mq_XXXXXX.pipe)
+  rm -f "$pipefile"
+  mkfifo "$pipefile"
+  chmod 600 "$jsfile" "$errorfile" "$pipefile"
+  printf '%s\n' "$js" > "$jsfile"
 
-  "$MONGOSH" "$MONGO_URI" --quiet --file "$jsfile" >> "$outfile" 2> "$errorfile" &
-  local pid=$! i=0 current="" progress_offset=0
-  while kill -0 "$pid" 2>/dev/null; do
-    local progress_end reported
-    progress_end=$(stat -c %s "$progressfile")
-    if (( progress_end > progress_offset )); then
-      local next_offset="$progress_offset"
-      while IFS= read -r reported; do
-        next_offset=$((next_offset + ${#reported} + 1))
-        if [[ "$reported" =~ ^__PROGRESS__:([0-9]+)$ ]]; then
-          current="${BASH_REMATCH[1]}"
-          show_progress "$msg" "$current" "$total" "$i"
-        fi
-      done < <(get_progress_lines_since "$progressfile" "$progress_offset" "$progress_end")
-      progress_offset=$next_offset
-    elif [[ -z "$current" ]]; then
-      show_progress "$msg" "$current" "$total" "$i"
-    fi
-    ((i++))
-    sleep 0.1
-  done
+  "$MONGOSH" "$MONGO_URI" --quiet --file "$jsfile" >> "$outfile" 2> "$pipefile" &
+  pid=$!
+  exec 3< "$pipefile"
+  monitor_mongosh_output "$msg" "$pid" "$errorfile" "$total"
+  rc=$?
+  exec 3<&-
 
-  wait "$pid"
-  local rc=$?
-  local progress_end reported
-  progress_end=$(stat -c %s "$progressfile")
-  if (( progress_end > progress_offset )); then
-    local next_offset="$progress_offset"
-    while IFS= read -r reported; do
-      next_offset=$((next_offset + ${#reported} + 1))
-      if [[ "$reported" =~ ^__PROGRESS__:([0-9]+)$ ]]; then
-        current="${BASH_REMATCH[1]}"
-        show_progress "$msg" "$current" "$total" "$i"
-      fi
-    done < <(get_progress_lines_since "$progressfile" "$progress_offset" "$progress_end")
-    progress_offset=$next_offset
-  elif [[ -z "$current" ]]; then
-    show_progress "$msg" "$current" "$total" "$i"
-  fi
   if (( rc == 0 )); then
     printf "✓\n"
   else
@@ -490,16 +459,8 @@ run_export_streaming() {
     cat "$errorfile" >&2
   fi
 
-  rm -f "$jsfile" "$progressfile" "$errorfile"
+  rm -f "$jsfile" "$errorfile" "$pipefile"
   return $rc
-}
-
-build_count_expr() {
-  if [[ "$FILTER" == "{}" ]]; then
-    echo "col.estimatedDocumentCount()"
-  else
-    echo "col.countDocuments($FILTER)"
-  fi
 }
 
 escape_js_str() {
@@ -565,7 +526,7 @@ show_history() {
   print_sep
 
   local choice
-  read -rp "输入编号重新执行 (回车返回): " choice
+  read -erp "输入编号重新执行 (回车返回): " choice
   [[ -z "$choice" ]] && return
 
   if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#lines[@]} )); then
@@ -573,32 +534,10 @@ show_history() {
     if [[ "$col" != "$COLLECTION" ]]; then
       echo "  切换集合至: $col"
       COLLECTION="$col"
-      analyze_fields
+      refresh_collection_workspace
     fi
     FILTER="$flt"
-    echo ""
-    echo "执行: db.$COLLECTION.find($FILTER).sort({_id:-1}).limit($lim)"
-    print_sep
-    local count_expr
-    if [[ "$FILTER" == "{}" ]]; then
-      count_expr="col.estimatedDocumentCount()"
-    else
-      count_expr="col.countDocuments($FILTER)"
-    fi
-    local js
-    js=$(cat <<JSEOF
-const col = db.getSiblingDB('$DB').getCollection('$COLLECTION');
-col.find($FILTER).sort({_id:-1}).limit($lim).forEach(doc => print(JSON.stringify(doc, null, 2)));
-print('__TOTAL__:' + $count_expr);
-JSEOF
-)
-    local raw
-    raw=$(run_js "$js")
-    local total
-    total=$(echo "$raw" | grep '^__TOTAL__:' | sed 's/^__TOTAL__://')
-    echo "$raw" | grep -v '^__TOTAL__:'
-    print_sep
-    echo "匹配总数: ${total:-?} | 本次显示: $lim 条"
+    run_find_query "$FILTER" "" '{_id:-1}' "$lim" false
   else
     echo "无效编号"
   fi
@@ -632,12 +571,11 @@ select_collection() {
 
   local choice
   while true; do
-    read -rp "请选择集合编号 [1-${#cols[@]}]: " choice
+    read -erp "请选择集合编号 [1-${#cols[@]}]: " choice
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#cols[@]} )); then
       COLLECTION="${cols[$((choice - 1))]}"
       echo "已选择: $COLLECTION"
-      analyze_fields
-      RETURN_TO_MAIN=true
+      refresh_collection_workspace
       return
     fi
     echo "无效输入，请重新选择"
@@ -646,12 +584,16 @@ select_collection() {
 
 # ---------- field analysis ----------
 
-analyze_fields() {
-  echo "正在分析字段结构..."
+reset_collection_workspace() {
   FIELD_NAMES=()
   FIELD_TYPES=()
   SUGGESTIONS=()
   SUGGEST_FILTERS=()
+}
+
+refresh_collection_workspace() {
+  echo "正在分析字段结构..."
+  reset_collection_workspace
 
   local js
   js=$(cat <<'JSEOF'
@@ -733,8 +675,8 @@ prompt_filter_for_field() {
     string)
       echo "  字段 [$fname] (string) 过滤方式:" >&2
       echo "    [1] 精确匹配    [2] 模糊匹配(正则)" >&2
-      local mode; read -rp "  选择 [1/2]: " mode
-      local val;  read -rp "  输入值: " val
+      local mode; read -erp "  选择 [1/2]: " mode
+      local val;  read -erp "  输入值: " val
       val=$(escape_js_str "$val")
       if [[ "$mode" == "2" ]]; then
         echo "\"$fname\":{\"\$regex\":\"$val\",\"\$options\":\"i\"}"
@@ -745,16 +687,16 @@ prompt_filter_for_field() {
     number)
       echo "  字段 [$fname] (number) 过滤方式:" >&2
       echo "    [1] =等于  [2] >大于  [3] >=大于等于  [4] <小于  [5] <=小于等于  [6] 范围(min~max)" >&2
-      local mode; read -rp "  选择 [1-6]: " mode
+      local mode; read -erp "  选择 [1-6]: " mode
       case "$mode" in
-        1) local val; read -rp "  输入值: " val;     echo "\"$fname\":$(format_value "$val")" ;;
-        2) local val; read -rp "  大于: " val;       echo "\"$fname\":{\"\$gt\":$(format_value "$val")}" ;;
-        3) local val; read -rp "  大于等于: " val;   echo "\"$fname\":{\"\$gte\":$(format_value "$val")}" ;;
-        4) local val; read -rp "  小于: " val;       echo "\"$fname\":{\"\$lt\":$(format_value "$val")}" ;;
-        5) local val; read -rp "  小于等于: " val;   echo "\"$fname\":{\"\$lte\":$(format_value "$val")}" ;;
+        1) local val; read -erp "  输入值: " val;     echo "\"$fname\":$(format_value "$val")" ;;
+        2) local val; read -erp "  大于: " val;       echo "\"$fname\":{\"\$gt\":$(format_value "$val")}" ;;
+        3) local val; read -erp "  大于等于: " val;   echo "\"$fname\":{\"\$gte\":$(format_value "$val")}" ;;
+        4) local val; read -erp "  小于: " val;       echo "\"$fname\":{\"\$lt\":$(format_value "$val")}" ;;
+        5) local val; read -erp "  小于等于: " val;   echo "\"$fname\":{\"\$lte\":$(format_value "$val")}" ;;
         6)
-          local vmin; read -rp "  最小值(>=): " vmin
-          local vmax; read -rp "  最大值(<=): " vmax
+          local vmin; read -erp "  最小值(>=): " vmin
+          local vmax; read -erp "  最大值(<=): " vmax
           echo "\"$fname\":{\"\$gte\":$(format_value "$vmin"),\"\$lte\":$(format_value "$vmax")}"
           ;;
         *) echo "" ;;
@@ -763,32 +705,32 @@ prompt_filter_for_field() {
     boolean)
       echo "  字段 [$fname] (boolean):" >&2
       echo "    [1] true    [2] false" >&2
-      local mode; read -rp "  选择 [1/2]: " mode
+      local mode; read -erp "  选择 [1/2]: " mode
       [[ "$mode" == "1" ]] && echo "\"$fname\":true" || echo "\"$fname\":false"
       ;;
     date)
       echo "  字段 [$fname] (date) 过滤方式:" >&2
       echo "    [1] 之后(>)  [2] 之前(<)  [3] 范围" >&2
       echo "    日期格式: 2024-01-01 或 2024-01-01T00:00:00Z" >&2
-      local mode; read -rp "  选择 [1-3]: " mode
+      local mode; read -erp "  选择 [1-3]: " mode
       case "$mode" in
-        1) local val;  read -rp "  晚于: " val;  val=$(escape_js_str "$val");  echo "\"$fname\":{\"\$gt\":new Date(\"${val}\")}" ;;
-        2) local val;  read -rp "  早于: " val;  val=$(escape_js_str "$val");  echo "\"$fname\":{\"\$lt\":new Date(\"${val}\")}" ;;
+        1) local val;  read -erp "  晚于: " val;  val=$(escape_js_str "$val");  echo "\"$fname\":{\"\$gt\":new Date(\"${val}\")}" ;;
+        2) local val;  read -erp "  早于: " val;  val=$(escape_js_str "$val");  echo "\"$fname\":{\"\$lt\":new Date(\"${val}\")}" ;;
         3)
-          local vmin; read -rp "  开始日期(>=): " vmin; vmin=$(escape_js_str "$vmin")
-          local vmax; read -rp "  结束日期(<): " vmax; vmax=$(escape_js_str "$vmax")
+          local vmin; read -erp "  开始日期(>=): " vmin; vmin=$(escape_js_str "$vmin")
+          local vmax; read -erp "  结束日期(<): " vmax; vmax=$(escape_js_str "$vmax")
           echo "\"$fname\":{\"\$gte\":new Date(\"${vmin}\"),\"\$lt\":new Date(\"${vmax}\")}"
           ;;
         *) echo "" ;;
       esac
       ;;
     objectId)
-      local val; read -rp "  输入 ObjectId: " val
+      local val; read -erp "  输入 ObjectId: " val
       val=$(escape_js_str "$val")
       echo "\"$fname\":ObjectId(\"$val\")"
       ;;
     *)
-      local val; read -rp "  输入 $fname 的值: " val
+      local val; read -erp "  输入 $fname 的值: " val
       echo "\"$fname\":$(format_value "$val")"
       ;;
   esac
@@ -826,7 +768,7 @@ build_filter() {
 
     while true; do
       local input
-      read -rp "过滤(编号或表达式): " input
+      read -erp "过滤(编号或表达式): " input
       [[ -z "$input" || "$input" == "done" ]] && break
 
       if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= ${#FIELD_NAMES[@]} )); then
@@ -854,7 +796,7 @@ build_filter() {
     print_sep
     while true; do
       local input
-      read -rp "过滤条件: " input
+      read -erp "过滤条件: " input
       [[ -z "$input" || "$input" == "done" ]] && break
       local parsed
       parsed=$(parse_filter_expr "$input")
@@ -893,7 +835,7 @@ select_projection() {
   echo ""
 
   local input
-  read -rp "字段编号: " input
+  read -erp "字段编号: " input
   [[ -z "$input" ]] && return
 
   local -a proj_parts
@@ -929,14 +871,14 @@ select_sort() {
   echo ""
 
   local input
-  read -rp "字段编号: " input
+  read -erp "字段编号: " input
   [[ -z "$input" ]] && return
 
   if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= ${#FIELD_NAMES[@]} )); then
     local fname="${FIELD_NAMES[$((input - 1))]}"
     echo "  [1] 升序(ASC)  [2] 降序(DESC)"
     local dir
-    read -rp "  排序方向 [默认2]: " dir
+    read -erp "  排序方向 [默认2]: " dir
     dir=${dir:-2}
     if [[ "$dir" == "1" ]]; then
       SORT_SPEC="{\"$fname\":1}"
@@ -948,74 +890,63 @@ select_sort() {
 
 # ========== QUERY FUNCTIONS ==========
 
-do_query() {
-  local limit
-  read -rp "查询条数 [默认 $DEFAULT_LIMIT]: " limit
-  limit=${limit:-$DEFAULT_LIMIT}
-  [[ ! "$limit" =~ ^[0-9]+$ ]] && limit=$DEFAULT_LIMIT
-
-  build_filter
+run_find_query() {
+  local filter="$1" projection="$2" sort_spec="$3" limit="$4" save_to_history="$5"
+  local find_args="$filter"
+  [[ -n "$projection" ]] && find_args="$find_args, $projection"
 
   echo ""
-  echo "执行: db.$COLLECTION.find($FILTER).sort({_id:-1}).limit($limit)"
+  echo "执行: db.$COLLECTION.find($find_args).sort($sort_spec).limit($limit)"
   print_sep
 
   local count_expr
-  count_expr=$(build_count_expr)
+  if [[ "$filter" == "{}" ]]; then
+    count_expr="col.estimatedDocumentCount()"
+  else
+    count_expr="col.countDocuments($filter)"
+  fi
   local js
   js=$(cat <<JSEOF
 const col = db.getSiblingDB('$DB').getCollection('$COLLECTION');
-col.find($FILTER).sort({_id:-1}).limit($limit).forEach(doc => print(JSON.stringify(doc, null, 2)));
+col.find($find_args).sort($sort_spec).limit($limit).forEach(doc => print(JSON.stringify(doc, null, 2)));
 print('__TOTAL__:' + $count_expr);
 JSEOF
 )
   local raw
   raw=$(run_js "$js")
   local total
-  total=$(echo "$raw" | grep '^__TOTAL__:' | sed 's/^__TOTAL__://')
+  total=$(echo "$raw" | sed -n 's/^__TOTAL__://p' | head -1)
   echo "$raw" | grep -v '^__TOTAL__:'
   print_sep
   echo "匹配总数: ${total:-?} | 本次显示: $limit 条"
 
-  save_history "$FILTER" "$limit"
+  [[ "$save_to_history" == "true" ]] && save_history "$filter" "$limit"
+}
+
+do_query() {
+  local limit
+  read -erp "查询条数 [默认 $DEFAULT_LIMIT]: " limit
+  limit=${limit:-$DEFAULT_LIMIT}
+  [[ ! "$limit" =~ ^[0-9]+$ ]] && limit=$DEFAULT_LIMIT
+
+  build_filter
+  run_find_query "$FILTER" "" '{_id:-1}' "$limit" true
 }
 
 do_query_projection() {
   local limit
-  read -rp "查询条数 [默认 $DEFAULT_LIMIT]: " limit
+  read -erp "查询条数 [默认 $DEFAULT_LIMIT]: " limit
   limit=${limit:-$DEFAULT_LIMIT}
   [[ ! "$limit" =~ ^[0-9]+$ ]] && limit=$DEFAULT_LIMIT
 
   build_filter
   select_projection
-
-  echo ""
-  echo "执行: db.$COLLECTION.find($FILTER, $PROJECTION).sort({_id:-1}).limit($limit)"
-  print_sep
-
-  local count_expr
-  count_expr=$(build_count_expr)
-  local js
-  js=$(cat <<JSEOF
-const col = db.getSiblingDB('$DB').getCollection('$COLLECTION');
-col.find($FILTER, $PROJECTION).sort({_id:-1}).limit($limit).forEach(doc => print(JSON.stringify(doc, null, 2)));
-print('__TOTAL__:' + $count_expr);
-JSEOF
-)
-  local raw
-  raw=$(run_js "$js")
-  local total
-  total=$(echo "$raw" | grep '^__TOTAL__:' | sed 's/^__TOTAL__://')
-  echo "$raw" | grep -v '^__TOTAL__:'
-  print_sep
-  echo "匹配总数: ${total:-?} | 本次显示: $limit 条"
-
-  save_history "$FILTER" "$limit"
+  run_find_query "$FILTER" "$PROJECTION" '{_id:-1}' "$limit" true
 }
 
 do_query_pagination() {
   local page_size
-  read -rp "每页条数 [默认 $DEFAULT_LIMIT]: " page_size
+  read -erp "每页条数 [默认 $DEFAULT_LIMIT]: " page_size
   page_size=${page_size:-$DEFAULT_LIMIT}
   [[ ! "$page_size" =~ ^[0-9]+$ ]] && page_size=$DEFAULT_LIMIT
 
@@ -1046,13 +977,13 @@ do_query_pagination() {
 
     echo "  [n] 下一页  [p] 上一页  [g] 跳转页  [q] 退出分页"
     local nav
-    read -rp "操作: " nav
+    read -erp "操作: " nav
     case "$nav" in
       n|N) (( page < total_pages )) && ((page++)) || echo "已是最后一页" ;;
       p|P) (( page > 1 )) && ((page--)) || echo "已是第一页" ;;
       g|G)
         local gp
-        read -rp "跳转到第几页 [1-$total_pages]: " gp
+        read -erp "跳转到第几页 [1-$total_pages]: " gp
         if [[ "$gp" =~ ^[0-9]+$ ]] && (( gp >= 1 && gp <= total_pages )); then
           page=$gp
         else
@@ -1108,35 +1039,13 @@ JSEOF
 
 do_query_custom_sort() {
   local limit
-  read -rp "查询条数 [默认 $DEFAULT_LIMIT]: " limit
+  read -erp "查询条数 [默认 $DEFAULT_LIMIT]: " limit
   limit=${limit:-$DEFAULT_LIMIT}
   [[ ! "$limit" =~ ^[0-9]+$ ]] && limit=$DEFAULT_LIMIT
 
   build_filter
   select_sort
-
-  echo ""
-  echo "执行: db.$COLLECTION.find($FILTER).sort($SORT_SPEC).limit($limit)"
-  print_sep
-
-  local count_expr
-  count_expr=$(build_count_expr)
-  local js
-  js=$(cat <<JSEOF
-const col = db.getSiblingDB('$DB').getCollection('$COLLECTION');
-col.find($FILTER).sort($SORT_SPEC).limit($limit).forEach(doc => print(JSON.stringify(doc, null, 2)));
-print('__TOTAL__:' + $count_expr);
-JSEOF
-)
-  local raw
-  raw=$(run_js "$js")
-  local total
-  total=$(echo "$raw" | grep '^__TOTAL__:' | sed 's/^__TOTAL__://')
-  echo "$raw" | grep -v '^__TOTAL__:'
-  print_sep
-  echo "匹配总数: ${total:-?} | 本次显示: $limit 条"
-
-  save_history "$FILTER" "$limit"
+  run_find_query "$FILTER" "" "$SORT_SPEC" "$limit" true
 }
 
 # ========== DATA OPERATIONS ==========
@@ -1156,7 +1065,7 @@ do_delete() {
 
   echo "  [1] 删除一条(deleteOne)  [2] 删除全部(deleteMany)"
   local mode
-  read -rp "选择: " mode
+  read -erp "选择: " mode
 
   local op
   case "$mode" in
@@ -1172,7 +1081,7 @@ do_delete() {
   echo "即将执行: db.$COLLECTION.$op($FILTER)"
   echo "  影响文档数: $([[ "$op" == "deleteOne" ]] && echo "1" || echo "$count")"
   local confirm
-  read -rp "确认删除? [y/N]: " confirm
+  read -erp "确认删除? [y/N]: " confirm
   [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "已取消" && return
 
   local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').$op($FILTER)"
@@ -1208,7 +1117,7 @@ do_update() {
   print_sep
 
   local fidx
-  read -rp "字段编号: " fidx
+  read -erp "字段编号: " fidx
   if ! [[ "$fidx" =~ ^[0-9]+$ ]] || (( fidx < 1 || fidx > ${#FIELD_NAMES[@]} )); then
     echo "无效编号，已取消"
     return
@@ -1216,7 +1125,7 @@ do_update() {
 
   local fname="${FIELD_NAMES[$((fidx - 1))]}"
   local newval
-  read -rp "  $fname 的新值: " newval
+  read -erp "  $fname 的新值: " newval
 
   local formatted_val
   formatted_val=$(format_value "$newval")
@@ -1224,7 +1133,7 @@ do_update() {
   echo ""
   echo "  [1] 更新一条(updateOne)  [2] 更新全部(updateMany)"
   local mode
-  read -rp "选择: " mode
+  read -erp "选择: " mode
 
   local op
   case "$mode" in
@@ -1240,7 +1149,7 @@ do_update() {
   fi
   echo "即将执行: db.$COLLECTION.$op($FILTER, $update_doc)"
   local confirm
-  read -rp "确认更新? [y/N]: " confirm
+  read -erp "确认更新? [y/N]: " confirm
   [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "已取消" && return
 
   local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').$op($FILTER, $update_doc)"
@@ -1264,7 +1173,7 @@ do_export() {
   echo "匹配文档数: $total"
 
   local export_limit
-  read -rp "导出条数上限 [默认 $EXPORT_LIMIT，0=不限]: " export_limit
+  read -erp "导出条数上限 [默认 $EXPORT_LIMIT，0=不限]: " export_limit
   export_limit=${export_limit:-$EXPORT_LIMIT}
   [[ ! "$export_limit" =~ ^[0-9]+$ ]] && export_limit=$EXPORT_LIMIT
 
@@ -1281,7 +1190,7 @@ do_export() {
   echo ""
   echo "导出格式:  [1] JSON  [2] CSV"
   local fmt
-  read -rp "选择 [默认1]: " fmt
+  read -erp "选择 [默认1]: " fmt
   fmt=${fmt:-1}
 
   local ts
@@ -1317,9 +1226,7 @@ do_export() {
 
     local js
     js=$(cat <<JSEOF
-const fs = require('fs');
-const progressFile = '__PROGRESS_FILE__';
-const reportProgress = count => fs.appendFileSync(progressFile, '__PROGRESS__:' + count + '\n');
+const reportProgress = count => console.error('__PROGRESS__:' + count);
 const cursor = db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER)${limit_clause};
 let exported = 0;
 cursor.forEach(doc => {
@@ -1339,9 +1246,7 @@ JSEOF
     # JSON export
     local js
     js=$(cat <<JSEOF
-const fs = require('fs');
-const progressFile = '__PROGRESS_FILE__';
-const reportProgress = count => fs.appendFileSync(progressFile, '__PROGRESS__:' + count + '\n');
+const reportProgress = count => console.error('__PROGRESS__:' + count);
 const cursor = db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER)${limit_clause};
 let exported = 0;
 cursor.forEach(doc => {
@@ -1373,7 +1278,7 @@ do_import() {
   echo "导入 JSON Lines 数据（每行一条 JSON 文档）"
   echo "  JSON 导入会保留文件中的 _id；重复 _id 会被跳过并计入失败数。"
   local infile
-  read -rp "导入文件路径: " infile
+  read -erp "导入文件路径: " infile
 
   if [[ ! -f "$infile" || ! -r "$infile" ]]; then
     echo "错误: 文件不存在或不可读"
@@ -1463,7 +1368,7 @@ JSEOF
   echo ""
   echo "⚠ 将向集合 [$COLLECTION] 插入 $total 条文档，此操作不可撤销。"
   local confirm
-  read -rp "确认导入? [y/N]: " confirm
+  read -erp "确认导入? [y/N]: " confirm
   if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
     echo "已取消"
     rm -f "$snapshot"
@@ -1601,7 +1506,7 @@ create_index() {
 
   while true; do
     local input
-    read -rp "添加第$((added+1))个字段 (编号/done): " input
+    read -erp "添加第$((added+1))个字段 (编号/done): " input
     [[ "$input" == "done" ]] && break
     [[ -z "$input" ]] && continue
 
@@ -1609,7 +1514,7 @@ create_index() {
       local fname="${FIELD_NAMES[$((input - 1))]}"
       echo "    [1] 升序(ASC)  [2] 降序(DESC)  [3] TEXT  [4] HASHED"
       local order
-      read -rp "  $fname 的排序方式 [默认1]: " order
+      read -erp "  $fname 的排序方式 [默认1]: " order
       order=${order:-1}
       case "$order" in
         1) idx_fields+=("\"$fname\":1") ;;
@@ -1638,7 +1543,7 @@ create_index() {
   echo "索引选项:"
   echo "  [1] 普通索引  [2] 唯一索引(UNIQUE)  [3] 稀疏索引(SPARSE)  [4] 唯一+稀疏"
   local opt
-  read -rp "选择 [默认1]: " opt
+  read -erp "选择 [默认1]: " opt
   opt=${opt:-1}
 
   local options="{}"
@@ -1650,7 +1555,7 @@ create_index() {
   esac
 
   local idx_name=""
-  read -rp "索引名称 (回车自动生成): " idx_name
+  read -erp "索引名称 (回车自动生成): " idx_name
   if [[ -n "$idx_name" ]]; then
     options="${options%\}},\"name\":\"$idx_name\"}"
     options="${options/\{,/\{}"
@@ -1659,7 +1564,7 @@ create_index() {
   echo ""
   echo "即将创建: db.$COLLECTION.createIndex($key_spec, $options)"
   local confirm
-  read -rp "确认创建? [y/N]: " confirm
+  read -erp "确认创建? [y/N]: " confirm
   [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "已取消" && return
 
   local display_name="${idx_name:-$key_spec}"
@@ -1697,7 +1602,7 @@ drop_index() {
   print_sep
 
   local choice
-  read -rp "输入要删除的索引编号 (回车取消): " choice
+  read -erp "输入要删除的索引编号 (回车取消): " choice
   [[ -z "$choice" ]] && echo "已取消" && return
 
   if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#idx_names[@]} )); then
@@ -1714,7 +1619,7 @@ drop_index() {
   echo ""
   echo "即将删除索引: $target"
   local confirm
-  read -rp "确认删除? [y/N]: " confirm
+  read -erp "确认删除? [y/N]: " confirm
   [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "已取消" && return
 
   local drop_js="db.getSiblingDB('$DB').getCollection('$COLLECTION').dropIndex('$target')"
@@ -1735,7 +1640,7 @@ rename_collection() {
   echo ""
   echo "当前集合: $COLLECTION"
   local new_name
-  read -rp "输入新名称 (回车取消): " new_name
+  read -erp "输入新名称 (回车取消): " new_name
   [[ -z "$new_name" ]] && echo "已取消" && return
 
   if [[ "$new_name" == "$COLLECTION" ]]; then
@@ -1755,7 +1660,7 @@ rename_collection() {
   echo ""
   echo "即将执行: $COLLECTION -> $new_name"
   local confirm
-  read -rp "确认重命名? [y/N]: " confirm
+  read -erp "确认重命名? [y/N]: " confirm
   [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "已取消" && return
 
   local js="db.getSiblingDB('admin').runCommand({renameCollection:'$DB.$COLLECTION',to:'$DB.$safe_name'})"
@@ -1765,7 +1670,7 @@ rename_collection() {
     echo "重命名成功"
     COLLECTION="$new_name"
     echo "当前集合已切换为: $COLLECTION"
-    analyze_fields
+    refresh_collection_workspace
   else
     echo "重命名失败: $RUN_JS_RESULT" >&2
   fi
@@ -1780,7 +1685,7 @@ drop_collection() {
   echo "⚠ 此操作不可恢复！"
   echo "请输入集合名称 [$COLLECTION] 以确认删除:"
   local input
-  read -rp "> " input
+  read -erp "> " input
 
   if [[ "$input" != "$COLLECTION" ]]; then
     echo "名称不匹配，已取消"
@@ -1793,7 +1698,8 @@ drop_collection() {
   if [[ "$RUN_JS_RESULT" == "true" ]]; then
     echo "删除成功"
     echo "请重新选择集合"
-    select_collection
+    select_collection || return 1
+    return "$NAV_RETURN_TO_MAIN"
   else
     echo "删除失败: $RUN_JS_RESULT" >&2
   fi
@@ -1802,7 +1708,7 @@ drop_collection() {
 create_collection() {
   echo ""
   local name
-  read -rp "新集合名称: " name
+  read -erp "新集合名称: " name
   [[ -z "$name" ]] && echo "已取消" && return
 
   local safe_name
@@ -1816,16 +1722,16 @@ create_collection() {
 
   echo "  [1] 普通集合  [2] 固定大小集合(Capped)"
   local mode
-  read -rp "选择 [默认1]: " mode
+  read -erp "选择 [默认1]: " mode
   mode=${mode:-1}
 
   local js
   if [[ "$mode" == "2" ]]; then
     local size
-    read -rp "最大大小(字节，如 10485760 = 10MB): " size
+    read -erp "最大大小(字节，如 10485760 = 10MB): " size
     [[ -z "$size" ]] && size=10485760
     local max_docs
-    read -rp "最大文档数(回车不限): " max_docs
+    read -erp "最大文档数(回车不限): " max_docs
 
     if [[ -n "$max_docs" ]]; then
       js="db.getSiblingDB('$DB').createCollection('$safe_name',{capped:true,size:$size,max:$max_docs})"
@@ -1841,7 +1747,7 @@ create_collection() {
   if echo "$RUN_JS_RESULT" | grep -q '"ok" *: *1'; then
     echo "创建成功，已自动切换到: $name"
     COLLECTION="$name"
-    analyze_fields
+    refresh_collection_workspace
   else
     echo "创建失败: $RUN_JS_RESULT" >&2
   fi
@@ -1898,7 +1804,7 @@ do_aggregation() {
   print_sep
 
   local fidx
-  read -rp "字段编号: " fidx
+  read -erp "字段编号: " fidx
   if ! [[ "$fidx" =~ ^[0-9]+$ ]] || (( fidx < 1 || fidx > ${#FIELD_NAMES[@]} )); then
     echo "无效编号"
     return
@@ -1909,7 +1815,7 @@ do_aggregation() {
   echo "聚合操作:"
   echo "  [1] count  [2] sum  [3] avg  [4] min  [5] max"
   local op
-  read -rp "选择: " op
+  read -erp "选择: " op
 
   local agg_op
   case "$op" in
@@ -1924,7 +1830,7 @@ do_aggregation() {
   echo ""
   echo "是否按字段分组? (输入字段编号，回车跳过)"
   local gidx
-  read -rp "分组字段编号: " gidx
+  read -erp "分组字段编号: " gidx
 
   local group_field="null"
   if [[ "$gidx" =~ ^[0-9]+$ ]] && (( gidx >= 1 && gidx <= ${#FIELD_NAMES[@]} )); then
@@ -1979,12 +1885,12 @@ switch_database() {
     echo "无法获取数据库列表 (可能缺少权限)"
     echo "手动输入数据库名称:"
     local manual_db
-    read -rp "> " manual_db
+    read -erp "> " manual_db
     [[ -z "$manual_db" ]] && echo "已取消" && return
     rebuild_uri_with_db "$manual_db"
     echo "已切换到: $DB"
-    select_collection
-    return
+    select_collection || return 1
+    return "$NAV_RETURN_TO_MAIN"
   fi
 
   local -a db_names
@@ -2006,11 +1912,12 @@ switch_database() {
   print_sep
 
   local choice
-  read -rp "选择数据库 [1-${#db_names[@]}]: " choice
+  read -erp "选择数据库 [1-${#db_names[@]}]: " choice
   if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#db_names[@]} )); then
     rebuild_uri_with_db "${db_names[$((choice - 1))]}"
     echo "已切换到: $DB"
-    select_collection
+    select_collection || return 1
+    return "$NAV_RETURN_TO_MAIN"
   else
     echo "无效输入"
   fi
@@ -2025,8 +1932,9 @@ switch_environment() {
     return
   fi
 
-  load_config_multi_env "$cfg"
-  select_collection
+  load_config_multi_env "$cfg" || return 1
+  select_collection || return 1
+  return "$NAV_RETURN_TO_MAIN"
 }
 
 # ========== SUB-MENUS ==========
@@ -2041,7 +1949,7 @@ menu_query() {
     echo "  [b] 返回主菜单"
     echo "──────────────────────────────"
     local act
-    read -rp "选择: " act
+    read -erp "选择: " act
     case "$act" in
       1) do_query ;;
       2) do_query_projection ;;
@@ -2064,7 +1972,7 @@ menu_data() {
     echo "  [b] 返回主菜单"
     echo "──────────────────────────────"
     local act
-    read -rp "选择: " act
+    read -erp "选择: " act
     case "$act" in
       1) do_delete ;;
       2) do_update ;;
@@ -2085,7 +1993,7 @@ menu_index() {
     echo "  [b] 返回主菜单"
     echo "──────────────────────────────"
     local act
-    read -rp "选择: " act
+    read -erp "选择: " act
     case "$act" in
       1) show_indexes ;;
       2) create_index ;;
@@ -2098,7 +2006,6 @@ menu_index() {
 
 menu_collection() {
   while true; do
-    $RETURN_TO_MAIN && return
     echo ""
     echo "── 集合管理 ──────────────────"
     echo "  [1] 切换集合        [2] 查看字段"
@@ -2107,12 +2014,12 @@ menu_collection() {
     echo "  [b] 返回主菜单"
     echo "──────────────────────────────"
     local act
-    read -rp "选择: " act
+    read -erp "选择: " act
     case "$act" in
-      1) select_collection ;;
-      2) analyze_fields ;;
+      1) select_collection && return ;;
+      2) refresh_collection_workspace ;;
       3) rename_collection ;;
-      4) drop_collection ;;
+      4) drop_collection; [[ $? -eq "$NAV_RETURN_TO_MAIN" ]] && return ;;
       5) create_collection ;;
       b|B) return ;;
       *) echo "无效输入" ;;
@@ -2129,7 +2036,7 @@ menu_stats() {
     echo "  [b] 返回主菜单"
     echo "──────────────────────────────"
     local act
-    read -rp "选择: " act
+    read -erp "选择: " act
     case "$act" in
       1) do_coll_stats ;;
       2) do_aggregation ;;
@@ -2141,7 +2048,6 @@ menu_stats() {
 
 menu_env() {
   while true; do
-    $RETURN_TO_MAIN && return
     echo ""
     echo "── 环境切换 ──────────────────"
     echo "  [1] 切换数据库"
@@ -2149,10 +2055,10 @@ menu_env() {
     echo "  [b] 返回主菜单"
     echo "──────────────────────────────"
     local act
-    read -rp "选择: " act
+    read -erp "选择: " act
     case "$act" in
-      1) switch_database ;;
-      2) switch_environment ;;
+      1) switch_database; [[ $? -eq "$NAV_RETURN_TO_MAIN" ]] && return ;;
+      2) switch_environment; [[ $? -eq "$NAV_RETURN_TO_MAIN" ]] && return ;;
       b|B) return ;;
       *) echo "无效输入" ;;
     esac
@@ -2171,10 +2077,8 @@ main() {
   if ! select_collection; then
     echo "提示: 请通过 [e] 环境切换 检查配置" >&2
   fi
-  RETURN_TO_MAIN=false
 
   while true; do
-    RETURN_TO_MAIN=false
     echo ""
     echo "=============================="
     echo "  MongoDB 交互管理工具"
@@ -2188,7 +2092,7 @@ main() {
     echo "  快捷: [1] 快速查询  [f] 查看字段"
     echo ""
     local action
-    read -rp "请输入: " action
+    read -erp "请输入: " action
     case "$action" in
       q|Q) menu_query ;;
       d|D) menu_data ;;
@@ -2199,7 +2103,7 @@ main() {
       h|H) show_history ;;
       x|X) echo "再见"; exit 0 ;;
       1)   do_query ;;
-      f|F) analyze_fields ;;
+      f|F) refresh_collection_workspace ;;
       *)   echo "无效输入" ;;
     esac
   done
