@@ -356,8 +356,10 @@ print_sep() {
 }
 
 RUN_JS_RESULT=""
-get_progress_counts() {
-  sed -n 's/^__PROGRESS__:\([0-9][0-9]*\)$/\1/p' "$1"
+get_progress_lines_since() {
+  local file="$1" start="$2" end="$3"
+  (( end > start )) || return
+  dd if="$file" iflag=skip_bytes,count_bytes skip="$start" count="$((end - start))" status=none 2>/dev/null
 }
 
 show_progress() {
@@ -374,6 +376,7 @@ show_progress() {
 
 run_js_spinner() {
   local msg="$1" js="$2" total="${3:-}"
+  local LC_ALL=C
   local jsfile tmpfile
   jsfile=$(mktemp /tmp/mq_XXXXXX.js)
   tmpfile=$(mktemp /tmp/mq_XXXXXX.out)
@@ -381,33 +384,44 @@ run_js_spinner() {
   echo "$js" > "$jsfile"
 
   "$MONGOSH" "$MONGO_URI" --quiet --file "$jsfile" > "$tmpfile" 2>&1 &
-  local pid=$! i=0 current="" progress_seen=0
+  local pid=$! i=0 current="" progress_offset=0
   while kill -0 "$pid" 2>/dev/null; do
-    local progress_count=0 reported
-    while IFS= read -r reported; do
-      ((progress_count++))
-      if (( progress_count > progress_seen )); then
-        current="$reported"
-        show_progress "$msg" "$current" "$total" "$i"
-      fi
-    done < <(get_progress_counts "$tmpfile")
-    progress_seen=$progress_count
-    (( progress_count == 0 )) && show_progress "$msg" "$current" "$total" "$i"
+    local progress_end reported
+    progress_end=$(stat -c %s "$tmpfile")
+    if (( progress_end > progress_offset )); then
+      local next_offset="$progress_offset"
+      while IFS= read -r reported; do
+        next_offset=$((next_offset + ${#reported} + 1))
+        if [[ "$reported" =~ ^__PROGRESS__:([0-9]+)$ ]]; then
+          current="${BASH_REMATCH[1]}"
+          show_progress "$msg" "$current" "$total" "$i"
+        fi
+      done < <(get_progress_lines_since "$tmpfile" "$progress_offset" "$progress_end")
+      progress_offset=$next_offset
+    elif [[ -z "$current" ]]; then
+      show_progress "$msg" "$current" "$total" "$i"
+    fi
     ((i++))
     sleep 0.1
   done
 
   wait "$pid"
   local rc=$?
-  local progress_count=0 reported
-  while IFS= read -r reported; do
-    ((progress_count++))
-    if (( progress_count > progress_seen )); then
-      current="$reported"
-      show_progress "$msg" "$current" "$total" "$i"
-    fi
-  done < <(get_progress_counts "$tmpfile")
-  (( progress_count == 0 )) && show_progress "$msg" "$current" "$total" "$i"
+  local progress_end reported
+  progress_end=$(stat -c %s "$tmpfile")
+  if (( progress_end > progress_offset )); then
+    local next_offset="$progress_offset"
+    while IFS= read -r reported; do
+      next_offset=$((next_offset + ${#reported} + 1))
+      if [[ "$reported" =~ ^__PROGRESS__:([0-9]+)$ ]]; then
+        current="${BASH_REMATCH[1]}"
+        show_progress "$msg" "$current" "$total" "$i"
+      fi
+    done < <(get_progress_lines_since "$tmpfile" "$progress_offset" "$progress_end")
+    progress_offset=$next_offset
+  elif [[ -z "$current" ]]; then
+    show_progress "$msg" "$current" "$total" "$i"
+  fi
   if (( rc == 0 )); then
     printf "✓\n"
   else
@@ -421,6 +435,7 @@ run_js_spinner() {
 
 run_export_streaming() {
   local msg="$1" js="$2" outfile="$3" total="$4"
+  local LC_ALL=C
   local jsfile progressfile errorfile
   jsfile=$(mktemp /tmp/mq_XXXXXX.js)
   progressfile=$(mktemp /tmp/mq_XXXXXX.out)
@@ -430,33 +445,44 @@ run_export_streaming() {
   echo "$js" > "$jsfile"
 
   "$MONGOSH" "$MONGO_URI" --quiet --file "$jsfile" >> "$outfile" 2> "$errorfile" &
-  local pid=$! i=0 current="" progress_seen=0
+  local pid=$! i=0 current="" progress_offset=0
   while kill -0 "$pid" 2>/dev/null; do
-    local progress_count=0 reported
-    while IFS= read -r reported; do
-      ((progress_count++))
-      if (( progress_count > progress_seen )); then
-        current="$reported"
-        show_progress "$msg" "$current" "$total" "$i"
-      fi
-    done < <(get_progress_counts "$progressfile")
-    progress_seen=$progress_count
-    (( progress_count == 0 )) && show_progress "$msg" "$current" "$total" "$i"
+    local progress_end reported
+    progress_end=$(stat -c %s "$progressfile")
+    if (( progress_end > progress_offset )); then
+      local next_offset="$progress_offset"
+      while IFS= read -r reported; do
+        next_offset=$((next_offset + ${#reported} + 1))
+        if [[ "$reported" =~ ^__PROGRESS__:([0-9]+)$ ]]; then
+          current="${BASH_REMATCH[1]}"
+          show_progress "$msg" "$current" "$total" "$i"
+        fi
+      done < <(get_progress_lines_since "$progressfile" "$progress_offset" "$progress_end")
+      progress_offset=$next_offset
+    elif [[ -z "$current" ]]; then
+      show_progress "$msg" "$current" "$total" "$i"
+    fi
     ((i++))
     sleep 0.1
   done
 
   wait "$pid"
   local rc=$?
-  local progress_count=0 reported
-  while IFS= read -r reported; do
-    ((progress_count++))
-    if (( progress_count > progress_seen )); then
-      current="$reported"
-      show_progress "$msg" "$current" "$total" "$i"
-    fi
-  done < <(get_progress_counts "$progressfile")
-  (( progress_count == 0 )) && show_progress "$msg" "$current" "$total" "$i"
+  local progress_end reported
+  progress_end=$(stat -c %s "$progressfile")
+  if (( progress_end > progress_offset )); then
+    local next_offset="$progress_offset"
+    while IFS= read -r reported; do
+      next_offset=$((next_offset + ${#reported} + 1))
+      if [[ "$reported" =~ ^__PROGRESS__:([0-9]+)$ ]]; then
+        current="${BASH_REMATCH[1]}"
+        show_progress "$msg" "$current" "$total" "$i"
+      fi
+    done < <(get_progress_lines_since "$progressfile" "$progress_offset" "$progress_end")
+    progress_offset=$next_offset
+  elif [[ -z "$current" ]]; then
+    show_progress "$msg" "$current" "$total" "$i"
+  fi
   if (( rc == 0 )); then
     printf "✓\n"
   else
