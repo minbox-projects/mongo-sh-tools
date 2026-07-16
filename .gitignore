@@ -4,3 +4,4 @@ config.json
 export_*.json
 export_*.csv
 *.tmp
+/.idea/
