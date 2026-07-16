@@ -1084,7 +1084,7 @@ do_delete() {
   read -erp "确认删除? [y/N]: " confirm
   [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "已取消" && return
 
-  local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').$op($FILTER)"
+  local js="const result = db.getSiblingDB('$DB').getCollection('$COLLECTION').$op($FILTER); print(EJSON.stringify(result));"
   run_js_spinner "正在删除..." "$js"
   echo "结果: $RUN_JS_RESULT"
 }
@@ -1152,7 +1152,7 @@ do_update() {
   read -erp "确认更新? [y/N]: " confirm
   [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "已取消" && return
 
-  local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').$op($FILTER, $update_doc)"
+  local js="const result = db.getSiblingDB('$DB').getCollection('$COLLECTION').$op($FILTER, $update_doc); print(EJSON.stringify(result));"
   run_js_spinner "正在更新..." "$js"
   echo "结果: $RUN_JS_RESULT"
 }
@@ -1389,13 +1389,22 @@ let processed = 0;
 const errors = [];
 let batch = [];
 
+function getInsertedCount(result) {
+  if (typeof result?.insertedCount === 'number') return result.insertedCount;
+  if (Array.isArray(result?.insertedIds)) return result.insertedIds.length;
+  if (result?.insertedIds && typeof result.insertedIds === 'object') {
+    return Object.keys(result.insertedIds).length;
+  }
+  return 0;
+}
+
 async function insertBatch(documents) {
   if (documents.length === 0) return;
   try {
     const result = await col.insertMany(documents, { ordered: false });
-    inserted += result.insertedCount;
+    inserted += getInsertedCount(result);
   } catch (error) {
-    inserted += error.result?.insertedCount || 0;
+    inserted += getInsertedCount(error.result);
     errors.push(error.message);
   }
 }
@@ -1568,7 +1577,7 @@ create_index() {
   [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "已取消" && return
 
   local display_name="${idx_name:-$key_spec}"
-  local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').createIndex($key_spec, $options)"
+  local js="const result = db.getSiblingDB('$DB').getCollection('$COLLECTION').createIndex($key_spec, $options); print(EJSON.stringify({ok:1,name:result}));"
 
   run_js_spinner "正在创建索引 [$display_name] ..." "$js"
   echo "结果: $RUN_JS_RESULT"
@@ -1622,7 +1631,7 @@ drop_index() {
   read -erp "确认删除? [y/N]: " confirm
   [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "已取消" && return
 
-  local drop_js="db.getSiblingDB('$DB').getCollection('$COLLECTION').dropIndex('$target')"
+  local drop_js="const result = db.getSiblingDB('$DB').getCollection('$COLLECTION').dropIndex('$target'); print(EJSON.stringify(result));"
   run_js_spinner "正在删除索引 [$target] ..." "$drop_js"
 
   if echo "$RUN_JS_RESULT" | grep -q '"ok" *: *1'; then
@@ -1663,7 +1672,7 @@ rename_collection() {
   read -erp "确认重命名? [y/N]: " confirm
   [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "已取消" && return
 
-  local js="db.getSiblingDB('admin').runCommand({renameCollection:'$DB.$COLLECTION',to:'$DB.$safe_name'})"
+  local js="const result = db.getSiblingDB('admin').runCommand({renameCollection:'$DB.$COLLECTION',to:'$DB.$safe_name'}); print(EJSON.stringify(result));"
   run_js_spinner "正在重命名 [$COLLECTION] -> [$new_name] ..." "$js"
 
   if echo "$RUN_JS_RESULT" | grep -q '"ok" *: *1'; then
@@ -1692,7 +1701,7 @@ drop_collection() {
     return
   fi
 
-  local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').drop()"
+  local js="print(db.getSiblingDB('$DB').getCollection('$COLLECTION').drop())"
   run_js_spinner "正在删除集合 [$COLLECTION] ..." "$js"
 
   if [[ "$RUN_JS_RESULT" == "true" ]]; then
@@ -1734,12 +1743,12 @@ create_collection() {
     read -erp "最大文档数(回车不限): " max_docs
 
     if [[ -n "$max_docs" ]]; then
-      js="db.getSiblingDB('$DB').createCollection('$safe_name',{capped:true,size:$size,max:$max_docs})"
+    js="const result = db.getSiblingDB('$DB').createCollection('$safe_name',{capped:true,size:$size,max:$max_docs}); print(EJSON.stringify(result));"
     else
-      js="db.getSiblingDB('$DB').createCollection('$safe_name',{capped:true,size:$size})"
+    js="const result = db.getSiblingDB('$DB').createCollection('$safe_name',{capped:true,size:$size}); print(EJSON.stringify(result));"
     fi
   else
-    js="db.getSiblingDB('$DB').createCollection('$safe_name')"
+    js="const result = db.getSiblingDB('$DB').createCollection('$safe_name'); print(EJSON.stringify(result));"
   fi
 
   run_js_spinner "正在创建集合 [$name] ..." "$js"

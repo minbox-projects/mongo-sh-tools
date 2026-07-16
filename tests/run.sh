@@ -36,10 +36,12 @@ case "$script" in
   *getCollectionNames*) printf 'items\n' ;;
   *'const sample ='*) printf 'name|string\n' ;;
   *'__TOTAL__:'*) printf '{"name":"alpha"}\n__TOTAL__:1\n' ;;
-  *deleteOne*) printf '{"acknowledged":true,"deletedCount":1}\n' ;;
+  *deleteOne*'print(EJSON.stringify(result));'*) printf '{"acknowledged":true,"deletedCount":1}\n' ;;
+  *createCollection*'print(EJSON.stringify(result));'*) printf '{"ok":1}\n' ;;
   *estimatedDocumentCount*) printf '1\n' ;;
   *countDocuments*) printf '1\n' ;;
-  *'__IMPORT_RESULT__:'*) printf '__IMPORT_RESULT__:{"total":1,"inserted":1,"failed":0,"errors":[]}\n' ;;
+  *'function getInsertedCount('*'__IMPORT_RESULT__:'*) printf '__IMPORT_RESULT__:{"total":1,"inserted":1,"failed":0,"errors":[]}\n' ;;
+  *'__IMPORT_RESULT__:'*) printf '__IMPORT_RESULT__:{"total":1,"inserted":null,"failed":null,"errors":[]}\n' ;;
   *'__IMPORT_COUNT__:'*) printf '__IMPORT_COUNT__:1\n{"name":"alpha"}\n' ;;
   *listDatabases*) printf 'test|1\n' ;;
   *'cursor.forEach'*)
@@ -118,6 +120,15 @@ test_user_can_cancel_a_delete() {
   [[ "$output" != *"正在删除..."* ]] || fail "cancelled delete was executed"
 }
 
+test_user_can_create_a_collection() {
+  local app output
+  app=$(make_test_app)
+  output=$(printf '1\nc\n5\ncreated\n\nb\nx\n' | HOME="$TMP_DIR/home" bash "$app" 2>&1)
+
+  [[ "$output" == *"创建成功，已自动切换到: created"* ]] || fail "collection creation success was not displayed"
+  [[ "$output" != *"创建失败"* ]] || fail "successful collection creation was reported as failed"
+}
+
 test_collection_switch_returns_to_main_menu() {
   local app output
   app=$(make_test_app)
@@ -160,6 +171,7 @@ test_user_can_run_a_query
 test_user_can_export_json_lines
 test_user_can_delete_a_document
 test_user_can_cancel_a_delete
+test_user_can_create_a_collection
 test_collection_switch_returns_to_main_menu
 test_database_switch_returns_to_main_menu
 test_user_can_import_json_lines
