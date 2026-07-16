@@ -356,16 +356,14 @@ print_sep() {
 }
 
 RUN_JS_RESULT=""
-get_progress_count() {
-  sed -n 's/^__PROGRESS__:\([0-9][0-9]*\)$/\1/p' "$1" | tail -1
+get_progress_counts() {
+  sed -n 's/^__PROGRESS__:\([0-9][0-9]*\)$/\1/p' "$1"
 }
 
 show_progress() {
   local msg="$1" current="$2" total="$3" spin_index="$4"
-  if [[ "$current" =~ ^[0-9]+$ && "$total" =~ ^[0-9]+$ ]] && (( total > 0 )); then
-    local percent=$(( current * 100 / total ))
-    (( percent > 100 )) && percent=100
-    printf "\r  %s: %s/%s (%d%%) " "$msg" "$current" "$total" "$percent"
+  if [[ "$current" =~ ^[0-9]+$ && "$total" =~ ^[0-9]+$ ]]; then
+    printf "\r  %s: %s / %s " "$msg" "$current" "$total"
   elif [[ "$current" =~ ^[0-9]+$ ]]; then
     printf "\r  %s: 已处理 %s 条 " "$msg" "$current"
   else
@@ -383,22 +381,33 @@ run_js_spinner() {
   echo "$js" > "$jsfile"
 
   "$MONGOSH" "$MONGO_URI" --quiet --file "$jsfile" > "$tmpfile" 2>&1 &
-  local pid=$! i=0 current=""
+  local pid=$! i=0 current="" progress_seen=0
   while kill -0 "$pid" 2>/dev/null; do
-    local reported
-    reported=$(get_progress_count "$tmpfile")
-    [[ "$reported" =~ ^[0-9]+$ ]] && current="$reported"
-    show_progress "$msg" "$current" "$total" "$i"
+    local progress_count=0 reported
+    while IFS= read -r reported; do
+      ((progress_count++))
+      if (( progress_count > progress_seen )); then
+        current="$reported"
+        show_progress "$msg" "$current" "$total" "$i"
+      fi
+    done < <(get_progress_counts "$tmpfile")
+    progress_seen=$progress_count
+    (( progress_count == 0 )) && show_progress "$msg" "$current" "$total" "$i"
     ((i++))
     sleep 0.1
   done
 
   wait "$pid"
   local rc=$?
-  local reported
-  reported=$(get_progress_count "$tmpfile")
-  [[ "$reported" =~ ^[0-9]+$ ]] && current="$reported"
-  show_progress "$msg" "$current" "$total" "$i"
+  local progress_count=0 reported
+  while IFS= read -r reported; do
+    ((progress_count++))
+    if (( progress_count > progress_seen )); then
+      current="$reported"
+      show_progress "$msg" "$current" "$total" "$i"
+    fi
+  done < <(get_progress_counts "$tmpfile")
+  (( progress_count == 0 )) && show_progress "$msg" "$current" "$total" "$i"
   if (( rc == 0 )); then
     printf "✓\n"
   else
@@ -412,37 +421,50 @@ run_js_spinner() {
 
 run_export_streaming() {
   local msg="$1" js="$2" outfile="$3" total="$4"
-  local jsfile progressfile
+  local jsfile progressfile errorfile
   jsfile=$(mktemp /tmp/mq_XXXXXX.js)
   progressfile=$(mktemp /tmp/mq_XXXXXX.out)
-  chmod 600 "$jsfile" "$progressfile"
+  errorfile=$(mktemp /tmp/mq_XXXXXX.err)
+  chmod 600 "$jsfile" "$progressfile" "$errorfile"
+  js="${js//__PROGRESS_FILE__/$progressfile}"
   echo "$js" > "$jsfile"
 
-  "$MONGOSH" "$MONGO_URI" --quiet --file "$jsfile" >> "$outfile" 2> "$progressfile" &
-  local pid=$! i=0 current=""
+  "$MONGOSH" "$MONGO_URI" --quiet --file "$jsfile" >> "$outfile" 2> "$errorfile" &
+  local pid=$! i=0 current="" progress_seen=0
   while kill -0 "$pid" 2>/dev/null; do
-    local reported
-    reported=$(get_progress_count "$progressfile")
-    [[ "$reported" =~ ^[0-9]+$ ]] && current="$reported"
-    show_progress "$msg" "$current" "$total" "$i"
+    local progress_count=0 reported
+    while IFS= read -r reported; do
+      ((progress_count++))
+      if (( progress_count > progress_seen )); then
+        current="$reported"
+        show_progress "$msg" "$current" "$total" "$i"
+      fi
+    done < <(get_progress_counts "$progressfile")
+    progress_seen=$progress_count
+    (( progress_count == 0 )) && show_progress "$msg" "$current" "$total" "$i"
     ((i++))
     sleep 0.1
   done
 
   wait "$pid"
   local rc=$?
-  local reported
-  reported=$(get_progress_count "$progressfile")
-  [[ "$reported" =~ ^[0-9]+$ ]] && current="$reported"
-  show_progress "$msg" "$current" "$total" "$i"
+  local progress_count=0 reported
+  while IFS= read -r reported; do
+    ((progress_count++))
+    if (( progress_count > progress_seen )); then
+      current="$reported"
+      show_progress "$msg" "$current" "$total" "$i"
+    fi
+  done < <(get_progress_counts "$progressfile")
+  (( progress_count == 0 )) && show_progress "$msg" "$current" "$total" "$i"
   if (( rc == 0 )); then
     printf "✓\n"
   else
     printf "✗\n"
-    grep -v '^__PROGRESS__:' "$progressfile" >&2
+    cat "$errorfile" >&2
   fi
 
-  rm -f "$jsfile" "$progressfile"
+  rm -f "$jsfile" "$progressfile" "$errorfile"
   return $rc
 }
 
@@ -1269,15 +1291,18 @@ do_export() {
 
     local js
     js=$(cat <<JSEOF
+const fs = require('fs');
+const progressFile = '__PROGRESS_FILE__';
+const reportProgress = count => fs.appendFileSync(progressFile, '__PROGRESS__:' + count + '\n');
 const cursor = db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER).sort({_id:-1})${limit_clause};
 let exported = 0;
 cursor.forEach(doc => {
   const row = [$field_access];
   print(row.join(','));
   exported += 1;
-  if (exported % 1000 === 0) console.error('__PROGRESS__:' + exported);
+  if (exported % 10 === 0) reportProgress(exported);
 });
-console.error('__PROGRESS__:' + exported);
+reportProgress(exported);
 JSEOF
 )
 
@@ -1288,14 +1313,17 @@ JSEOF
     # JSON export
     local js
     js=$(cat <<JSEOF
+const fs = require('fs');
+const progressFile = '__PROGRESS_FILE__';
+const reportProgress = count => fs.appendFileSync(progressFile, '__PROGRESS__:' + count + '\n');
 const cursor = db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER).sort({_id:-1})${limit_clause};
 let exported = 0;
 cursor.forEach(doc => {
   print(JSON.stringify(doc));
   exported += 1;
-  if (exported % 1000 === 0) console.error('__PROGRESS__:' + exported);
+  if (exported % 10 === 0) reportProgress(exported);
 });
-console.error('__PROGRESS__:' + exported);
+reportProgress(exported);
 JSEOF
 )
     : > "$outfile"
@@ -1426,7 +1454,7 @@ $parse_js
 const col = db.getSiblingDB("$escaped_db").getCollection("$escaped_collection");
 const batchSize = 500;
 let inserted = 0;
-let completed = 0;
+let processed = 0;
 const errors = [];
 let batch = [];
 
@@ -1439,18 +1467,19 @@ async function insertBatch(documents) {
     inserted += error.result?.insertedCount || 0;
     errors.push(error.message);
   }
-  completed += documents.length;
-  console.error('__PROGRESS__:' + completed);
 }
 
 const total = await readImportDocuments(importFile, async document => {
   batch.push(document);
+  processed += 1;
+  if (processed % 10 === 0) print('__PROGRESS__:' + processed);
   if (batch.length === batchSize) {
     await insertBatch(batch);
     batch = [];
   }
 });
 await insertBatch(batch);
+if (processed % 10 !== 0) print('__PROGRESS__:' + processed);
 
 print('__IMPORT_RESULT__:' + JSON.stringify({
   total,
