@@ -90,6 +90,51 @@ test_user_can_run_a_query() {
   [[ "$output" == *"匹配总数: 1 | 本次显示: 20 条"* ]] || fail "query total was not displayed"
 }
 
+test_user_can_return_to_previous_query_step() {
+  local app output
+  app=$(make_test_app)
+  output=$(printf '1\nq\n1\n5\nb\n3\n\nb\nx\n' | HOME="$TMP_DIR/home" bash "$app" 2>&1)
+
+  [[ "$output" == *"本次显示: 3 条"* ]] || fail "returning to the query limit did not use the modified value"
+  [[ "$output" != *"本次显示: 5 条"* ]] || fail "query used the value from before returning"
+}
+
+test_user_can_return_through_all_query_steps() {
+  local app output
+  app=$(make_test_app)
+  output=$(printf '1\nq\n1\n5\nb\n3\nb\nb\nb\nx\n' | HOME="$TMP_DIR/home" bash "$app" 2>&1)
+
+  [[ "$output" != *"执行: db.items.find"* ]] || fail "returning from the first query step did not cancel the workflow"
+  [[ "$output" == *"再见"* ]] || fail "query workflow did not return to the menu after repeated back"
+}
+
+test_user_can_return_in_projection_and_sort_queries() {
+  local app output
+  app=$(make_test_app)
+  output=$(printf '1\nq\n2\n5\nb\n6\n\nb\n\n1\nb\nx\n' | HOME="$TMP_DIR/home" bash "$app" 2>&1)
+  [[ "$output" == *"本次显示: 6 条"* ]] || fail "projection query did not retain the modified limit after returning"
+
+  app=$(make_test_app)
+  output=$(printf '1\nq\n5\n5\nb\n6\n\nb\n\n1\n1\nb\nx\n' | HOME="$TMP_DIR/home" bash "$app" 2>&1)
+  [[ "$output" == *'sort({"name":1}).limit(6)'* ]] || fail "custom sort query did not return to and modify the sort step"
+}
+
+test_user_can_return_in_pagination_setup() {
+  local app output
+  app=$(make_test_app)
+  output=$(printf '1\nq\n3\n5\nb\n6\n\nq\nb\nx\n' | HOME="$TMP_DIR/home" bash "$app" 2>&1)
+
+  [[ "$output" == *"第 1/1 页 (共 1 条，每页 6 条)"* ]] || fail "pagination did not use the modified page size after returning"
+}
+
+test_user_keeps_filters_when_returning_from_projection() {
+  local app output
+  app=$(make_test_app)
+  output=$(printf '1\nq\n2\n\nname=alpha\ndone\nb\ndone\n\nb\nx\n' | HOME="$TMP_DIR/home" bash "$app" 2>&1)
+
+  [[ "$output" == *'执行: db.items.find({"name":"alpha"}, {})'* ]] || fail "returning from projection discarded the existing filter"
+}
+
 test_user_can_export_json_lines() {
   local app output exported_file
   app=$(make_test_app)
@@ -118,6 +163,14 @@ test_user_can_cancel_a_delete() {
 
   [[ "$output" == *"已取消"* ]] || fail "delete cancellation was not displayed"
   [[ "$output" != *"正在删除..."* ]] || fail "cancelled delete was executed"
+}
+
+test_user_can_modify_delete_mode_after_returning() {
+  local app output
+  app=$(make_test_app)
+  output=$(printf '1\nd\n1\n\n1\nb\n2\ny\nb\nx\n' | HOME="$TMP_DIR/home" bash "$app" 2>&1)
+
+  [[ "$output" == *"即将执行: db.items.deleteMany({})"* ]] || fail "returning from delete confirmation did not restore mode selection"
 }
 
 test_user_can_create_a_collection() {
@@ -168,9 +221,15 @@ test_user_can_cancel_an_import() {
 
 test_user_can_edit_collection_selection_with_readline
 test_user_can_run_a_query
+test_user_can_return_to_previous_query_step
+test_user_can_return_through_all_query_steps
+test_user_can_return_in_projection_and_sort_queries
+test_user_can_return_in_pagination_setup
+test_user_keeps_filters_when_returning_from_projection
 test_user_can_export_json_lines
 test_user_can_delete_a_document
 test_user_can_cancel_a_delete
+test_user_can_modify_delete_mode_after_returning
 test_user_can_create_a_collection
 test_collection_switch_returns_to_main_menu
 test_database_switch_returns_to_main_menu
