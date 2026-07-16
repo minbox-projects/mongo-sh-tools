@@ -1345,7 +1345,7 @@ const reportProgress = count => fs.appendFileSync(progressFile, '__PROGRESS__:' 
 const cursor = db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER).sort({_id:-1})${limit_clause};
 let exported = 0;
 cursor.forEach(doc => {
-  print(JSON.stringify(doc));
+  print(EJSON.stringify(doc, null, 0, { relaxed: false }));
   exported += 1;
   if (exported % 10 === 0) reportProgress(exported);
 });

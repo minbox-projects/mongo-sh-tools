@@ -202,7 +202,7 @@ chmod +x mongo_sh_tools mongosh
 - **删除/更新**：当未设置过滤条件（空 filter）且选择了 Many 操作时，会显示醒目警告
 - **导出数据**：默认导出上限为 `10000` 条（可通过 `~/.mongo_sh_tools/config.json` 的 `exportLimit` 修改），导出时可临时输入其他值，输入 `0` 则不限制
 - CSV 导出以集合字段名作为表头，逐行流式输出，字段中的逗号替换为分号、换行替换为空格
-- 导入文件使用 JSON Lines 格式，即每行一条 JSON 文档；可直接导入脚本导出的 JSON 文件
+- 导出 JSON 使用严格 Extended JSON；导入文件使用 JSON Lines 格式（每行一条文档），可直接导入脚本导出的 JSON 文件并保留 `ObjectId`、`Date` 等 BSON 类型
 - 导入会保留文件中的 `_id`。若目标集合已有相同 `_id`，该文档会导入失败，结果会汇总成功数与失败数
 - 普通 JSON 无法保留 `ObjectId`、`Date` 等 BSON 类型；需要保留类型时，请提供 Extended JSON 格式的导入文件
 - 导出和导入过程中会显示已处理数量和总数
