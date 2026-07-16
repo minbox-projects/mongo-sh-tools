@@ -355,54 +355,95 @@ print_sep() {
   printf '%*s\n' 60 '' | tr ' ' '-'
 }
 
-run_with_spinner() {
-  local msg="$1"; shift
-  local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-  local i=0
-
-  "$@" &
-  local pid=$!
-
-  while kill -0 "$pid" 2>/dev/null; do
-    printf "\r  %s %s " "${spin:i++%${#spin}:1}" "$msg"
-    sleep 0.1
-  done
-
-  wait "$pid"
-  local rc=$?
-  if (( rc == 0 )); then
-    printf "\r  ✓ %s\n" "$msg"
-  else
-    printf "\r  ✗ %s\n" "$msg"
-  fi
-  return $rc
+RUN_JS_RESULT=""
+get_progress_count() {
+  sed -n 's/^__PROGRESS__:\([0-9][0-9]*\)$/\1/p' "$1" | tail -1
 }
 
-RUN_JS_RESULT=""
+show_progress() {
+  local msg="$1" current="$2" total="$3" spin_index="$4"
+  if [[ "$current" =~ ^[0-9]+$ && "$total" =~ ^[0-9]+$ ]] && (( total > 0 )); then
+    local percent=$(( current * 100 / total ))
+    (( percent > 100 )) && percent=100
+    printf "\r  %s: %s/%s (%d%%) " "$msg" "$current" "$total" "$percent"
+  elif [[ "$current" =~ ^[0-9]+$ ]]; then
+    printf "\r  %s: 已处理 %s 条 " "$msg" "$current"
+  else
+    local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    printf "\r  %s %s " "${spin:spin_index%${#spin}:1}" "$msg"
+  fi
+}
+
 run_js_spinner() {
-  local msg="$1" js="$2"
+  local msg="$1" js="$2" total="${3:-}"
   local jsfile tmpfile
   jsfile=$(mktemp /tmp/mq_XXXXXX.js)
   tmpfile=$(mktemp /tmp/mq_XXXXXX.out)
   chmod 600 "$jsfile" "$tmpfile"
   echo "$js" > "$jsfile"
 
-  run_with_spinner "$msg" "$MONGOSH" "$MONGO_URI" --quiet --file "$jsfile" > "$tmpfile" 2>&1
+  "$MONGOSH" "$MONGO_URI" --quiet --file "$jsfile" > "$tmpfile" 2>&1 &
+  local pid=$! i=0 current=""
+  while kill -0 "$pid" 2>/dev/null; do
+    local reported
+    reported=$(get_progress_count "$tmpfile")
+    [[ "$reported" =~ ^[0-9]+$ ]] && current="$reported"
+    show_progress "$msg" "$current" "$total" "$i"
+    ((i++))
+    sleep 0.1
+  done
 
-  RUN_JS_RESULT=$(cat "$tmpfile")
+  wait "$pid"
+  local rc=$?
+  local reported
+  reported=$(get_progress_count "$tmpfile")
+  [[ "$reported" =~ ^[0-9]+$ ]] && current="$reported"
+  show_progress "$msg" "$current" "$total" "$i"
+  if (( rc == 0 )); then
+    printf "✓\n"
+  else
+    printf "✗\n"
+  fi
+
+  RUN_JS_RESULT=$(grep -v '^__PROGRESS__:' "$tmpfile")
   rm -f "$jsfile" "$tmpfile"
+  return $rc
 }
 
 run_export_streaming() {
-  local msg="$1" js="$2" outfile="$3"
-  local jsfile
+  local msg="$1" js="$2" outfile="$3" total="$4"
+  local jsfile progressfile
   jsfile=$(mktemp /tmp/mq_XXXXXX.js)
-  chmod 600 "$jsfile"
+  progressfile=$(mktemp /tmp/mq_XXXXXX.out)
+  chmod 600 "$jsfile" "$progressfile"
   echo "$js" > "$jsfile"
 
-  run_with_spinner "$msg" "$MONGOSH" "$MONGO_URI" --quiet --file "$jsfile" >> "$outfile" 2>/dev/null
+  "$MONGOSH" "$MONGO_URI" --quiet --file "$jsfile" >> "$outfile" 2> "$progressfile" &
+  local pid=$! i=0 current=""
+  while kill -0 "$pid" 2>/dev/null; do
+    local reported
+    reported=$(get_progress_count "$progressfile")
+    [[ "$reported" =~ ^[0-9]+$ ]] && current="$reported"
+    show_progress "$msg" "$current" "$total" "$i"
+    ((i++))
+    sleep 0.1
+  done
 
-  rm -f "$jsfile"
+  wait "$pid"
+  local rc=$?
+  local reported
+  reported=$(get_progress_count "$progressfile")
+  [[ "$reported" =~ ^[0-9]+$ ]] && current="$reported"
+  show_progress "$msg" "$current" "$total" "$i"
+  if (( rc == 0 )); then
+    printf "✓\n"
+  else
+    printf "✗\n"
+    grep -v '^__PROGRESS__:' "$progressfile" >&2
+  fi
+
+  rm -f "$jsfile" "$progressfile"
+  return $rc
 }
 
 build_count_expr() {
@@ -1180,9 +1221,11 @@ do_export() {
   [[ ! "$export_limit" =~ ^[0-9]+$ ]] && export_limit=$EXPORT_LIMIT
 
   local limit_clause=""
+  local export_total="$total"
   if (( export_limit > 0 )); then
     limit_clause=".limit($export_limit)"
     if (( total > export_limit )); then
+      export_total=$export_limit
       echo "  提示: 匹配 $total 条，将只导出前 $export_limit 条 (可在 config.json 中修改 exportLimit)"
     fi
   fi
@@ -1198,6 +1241,7 @@ do_export() {
   local ext="json"
   [[ "$fmt" == "2" ]] && ext="csv"
   local outfile="$SCRIPT_DIR/export_${COLLECTION}_${ts}.$ext"
+  local export_rc=0
 
   if [[ "$fmt" == "2" ]]; then
     # CSV export
@@ -1226,20 +1270,43 @@ do_export() {
     local js
     js=$(cat <<JSEOF
 const cursor = db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER).sort({_id:-1})${limit_clause};
+let exported = 0;
 cursor.forEach(doc => {
   const row = [$field_access];
   print(row.join(','));
+  exported += 1;
+  if (exported % 1000 === 0) console.error('__PROGRESS__:' + exported);
 });
+console.error('__PROGRESS__:' + exported);
 JSEOF
 )
 
     echo "$header" > "$outfile"
-    run_export_streaming "正在导出 CSV..." "$js" "$outfile"
+    run_export_streaming "正在导出 CSV" "$js" "$outfile" "$export_total"
+    export_rc=$?
   else
     # JSON export
-    local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER).sort({_id:-1})${limit_clause}.forEach(doc => print(JSON.stringify(doc)))"
+    local js
+    js=$(cat <<JSEOF
+const cursor = db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER).sort({_id:-1})${limit_clause};
+let exported = 0;
+cursor.forEach(doc => {
+  print(JSON.stringify(doc));
+  exported += 1;
+  if (exported % 1000 === 0) console.error('__PROGRESS__:' + exported);
+});
+console.error('__PROGRESS__:' + exported);
+JSEOF
+)
     : > "$outfile"
-    run_export_streaming "正在导出 JSON..." "$js" "$outfile"
+    run_export_streaming "正在导出 JSON" "$js" "$outfile" "$export_total"
+    export_rc=$?
+  fi
+
+  if (( export_rc != 0 )); then
+    rm -f "$outfile"
+    echo "导出失败，已删除不完整文件"
+    return
   fi
 
   local line_count
@@ -1359,6 +1426,7 @@ $parse_js
 const col = db.getSiblingDB("$escaped_db").getCollection("$escaped_collection");
 const batchSize = 500;
 let inserted = 0;
+let completed = 0;
 const errors = [];
 let batch = [];
 
@@ -1371,6 +1439,8 @@ async function insertBatch(documents) {
     inserted += error.result?.insertedCount || 0;
     errors.push(error.message);
   }
+  completed += documents.length;
+  console.error('__PROGRESS__:' + completed);
 }
 
 const total = await readImportDocuments(importFile, async document => {
@@ -1395,7 +1465,7 @@ print('__IMPORT_RESULT__:' + JSON.stringify({
 JSEOF
 )
 
-  run_js_spinner "正在导入..." "$import_js"
+  run_js_spinner "正在导入" "$import_js" "$total"
   local run_result="$RUN_JS_RESULT"
   rm -f "$snapshot"
   local result

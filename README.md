@@ -205,6 +205,7 @@ chmod +x mongo_sh_tools mongosh
 - 导入文件使用 JSON Lines 格式，即每行一条 JSON 文档；可直接导入脚本导出的 JSON 文件
 - 导入会保留文件中的 `_id`。若目标集合已有相同 `_id`，该文档会导入失败，结果会汇总成功数与失败数
 - 普通 JSON 无法保留 `ObjectId`、`Date` 等 BSON 类型；需要保留类型时，请提供 Extended JSON 格式的导入文件
+- 导出和导入过程中会显示已处理数量、总数和完成百分比
 
 ### [i] 索引管理
 
