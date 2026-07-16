@@ -1320,7 +1320,7 @@ do_export() {
 const fs = require('fs');
 const progressFile = '__PROGRESS_FILE__';
 const reportProgress = count => fs.appendFileSync(progressFile, '__PROGRESS__:' + count + '\n');
-const cursor = db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER).sort({_id:-1})${limit_clause};
+const cursor = db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER)${limit_clause};
 let exported = 0;
 cursor.forEach(doc => {
   const row = [$field_access];
@@ -1342,7 +1342,7 @@ JSEOF
 const fs = require('fs');
 const progressFile = '__PROGRESS_FILE__';
 const reportProgress = count => fs.appendFileSync(progressFile, '__PROGRESS__:' + count + '\n');
-const cursor = db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER).sort({_id:-1})${limit_clause};
+const cursor = db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER)${limit_clause};
 let exported = 0;
 cursor.forEach(doc => {
   print(EJSON.stringify(doc, null, 0, { relaxed: false }));
